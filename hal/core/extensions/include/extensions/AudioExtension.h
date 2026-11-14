@@ -103,6 +103,14 @@ typedef void (*register_reconfig_cb_t)(int (*reconfig_cb)(tSESSION_TYPE, int));
 
 typedef void (*gef_init_t)(void);
 typedef void (*gef_deinit_t)(void);
+// Legacy libqtigefar API: the HAL hands over a callback that maps legacy devices and output
+// flags to PAL ids
+typedef int (*gef_get_pal_info_t)(void* adev, const audio_devices_t hal_device_id,
+                                  pal_device_id_t* pal_device_id,
+                                  audio_output_flags_t hal_stream_flag,
+                                  pal_stream_type_t* pal_stream_type);
+typedef void* (*gef_legacy_init_t)(void*, gef_get_pal_info_t);
+typedef void (*gef_legacy_deinit_t)(void*);
 
 static bool isExtensionEnabled(std::string property) {
     return property_get_bool(property.c_str(), false);
@@ -205,8 +213,10 @@ class GefExtension : public AudioExtensionBase {
     void gef_interface_deinit();
 
   private:
-    gef_init_t gef_init;
-    gef_deinit_t gef_deinit;
+    gef_init_t gef_init = nullptr;
+    gef_deinit_t gef_deinit = nullptr;
+    gef_legacy_deinit_t gef_legacy_deinit = nullptr;
+    void* gef_legacy_ptr = nullptr;
 };
 
 class AudioExtension {

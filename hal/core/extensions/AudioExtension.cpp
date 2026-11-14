@@ -499,12 +499,112 @@ KarokeExtension::KarokeExtension() : AudioExtensionBase(kKarokeLibrary) {
     }
 }
 
+namespace {
+pal_device_id_t gefLegacyToPalDevice(audio_devices_t device) {
+    switch (device) {
+        case AUDIO_DEVICE_OUT_EARPIECE:
+            return PAL_DEVICE_OUT_HANDSET;
+        case AUDIO_DEVICE_OUT_SPEAKER:
+        case AUDIO_DEVICE_OUT_SPEAKER_SAFE:
+            return PAL_DEVICE_OUT_SPEAKER;
+        case AUDIO_DEVICE_OUT_WIRED_HEADSET:
+            return PAL_DEVICE_OUT_WIRED_HEADSET;
+        case AUDIO_DEVICE_OUT_WIRED_HEADPHONE:
+            return PAL_DEVICE_OUT_WIRED_HEADPHONE;
+        case AUDIO_DEVICE_OUT_LINE:
+            return PAL_DEVICE_OUT_LINE;
+        case AUDIO_DEVICE_OUT_BLUETOOTH_SCO:
+        case AUDIO_DEVICE_OUT_BLUETOOTH_SCO_HEADSET:
+        case AUDIO_DEVICE_OUT_BLUETOOTH_SCO_CARKIT:
+            return PAL_DEVICE_OUT_BLUETOOTH_SCO;
+        case AUDIO_DEVICE_OUT_BLUETOOTH_A2DP:
+        case AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES:
+        case AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_SPEAKER:
+            return PAL_DEVICE_OUT_BLUETOOTH_A2DP;
+        case AUDIO_DEVICE_OUT_BLE_HEADSET:
+        case AUDIO_DEVICE_OUT_BLE_SPEAKER:
+            return PAL_DEVICE_OUT_BLUETOOTH_BLE;
+        case AUDIO_DEVICE_OUT_BLE_BROADCAST:
+            return PAL_DEVICE_OUT_BLUETOOTH_BLE_BROADCAST;
+        case AUDIO_DEVICE_OUT_AUX_DIGITAL:
+            return PAL_DEVICE_OUT_AUX_DIGITAL;
+        case AUDIO_DEVICE_OUT_USB_ACCESSORY:
+        case AUDIO_DEVICE_OUT_USB_DEVICE:
+            return PAL_DEVICE_OUT_USB_DEVICE;
+        case AUDIO_DEVICE_OUT_USB_HEADSET:
+            return PAL_DEVICE_OUT_USB_HEADSET;
+        case AUDIO_DEVICE_OUT_HEARING_AID:
+            return PAL_DEVICE_OUT_HEARING_AID;
+        case AUDIO_DEVICE_OUT_PROXY:
+            return PAL_DEVICE_OUT_PROXY;
+        default:
+            return PAL_DEVICE_NONE;
+    }
+}
+
+// Same mapping as StreamOutPrimary::GetPalStreamType() of the legacy HAL: flags that match no
+// stream type give PAL_STREAM_GENERIC, which PAL applies to every active stream.
+pal_stream_type_t gefLegacyToPalStreamType(audio_output_flags_t flags) {
+    if (flags & AUDIO_OUTPUT_FLAG_VOIP_RX) return PAL_STREAM_VOIP_RX;
+    if (flags & AUDIO_OUTPUT_FLAG_RAW) return PAL_STREAM_ULTRA_LOW_LATENCY;
+    if (flags & AUDIO_OUTPUT_FLAG_FAST) return PAL_STREAM_LOW_LATENCY;
+    if (flags & AUDIO_OUTPUT_FLAG_DEEP_BUFFER) return PAL_STREAM_DEEP_BUFFER;
+    if (flags & AUDIO_OUTPUT_FLAG_MMAP_NOIRQ) return PAL_STREAM_ULTRA_LOW_LATENCY;
+    if (flags == (AUDIO_OUTPUT_FLAG_DIRECT | AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD |
+                  AUDIO_OUTPUT_FLAG_NON_BLOCKING))
+        return PAL_STREAM_COMPRESSED;
+    if (flags == AUDIO_OUTPUT_FLAG_DIRECT) return PAL_STREAM_PCM_OFFLOAD;
+    if (flags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD) return PAL_STREAM_COMPRESSED;
+    if (flags == AUDIO_OUTPUT_FLAG_INCALL_MUSIC) return PAL_STREAM_VOICE_CALL_MUSIC;
+    return PAL_STREAM_GENERIC;
+}
+
+// Callback for the legacy gef_init(): fills one PAL device per bit of hal_device_id at most,
+// as libqtigefar allocates popcount(hal_device_id) entries, and returns the count.
+int gefLegacyGetPalInfo(void* /*adev*/, const audio_devices_t hal_device_id,
+                        pal_device_id_t* pal_device_id, audio_output_flags_t hal_stream_flag,
+                        pal_stream_type_t* pal_stream_type) {
+    if (pal_device_id == nullptr || pal_stream_type == nullptr) return -EINVAL;
+    *pal_stream_type = gefLegacyToPalStreamType(hal_stream_flag);
+    LOG(DEBUG) << __func__ << ": device 0x" << std::hex << hal_device_id << " flags 0x"
+               << hal_stream_flag << std::dec << " -> stream type " << *pal_stream_type;
+    if (hal_device_id == AUDIO_DEVICE_NONE) {
+        // Stream parameter: PAL_DEVICE_NONE matches the active streams on any device. libqtigefar
+        // allocates one entry in this case, zeroed, and 0 is PAL_DEVICE_OUT_MIN, which matches none.
+        pal_device_id[0] = PAL_DEVICE_NONE;
+        return 1;
+    }
+
+    pal_device_id_t palDevice = gefLegacyToPalDevice(hal_device_id);
+    if (palDevice != PAL_DEVICE_NONE) {
+        pal_device_id[0] = palDevice;
+        return 1;
+    }
+    // Legacy bit mask with several output devices
+    const uint32_t maxCount = __builtin_popcount(static_cast<uint32_t>(hal_device_id));
+    uint32_t count = 0;
+    for (uint32_t bit = 0; bit < 31 && count < maxCount; bit++) {
+        const uint32_t mask = 1u << bit;
+        if (!(hal_device_id & mask)) continue;
+        palDevice = gefLegacyToPalDevice(static_cast<audio_devices_t>(mask));
+        if (palDevice != PAL_DEVICE_NONE) pal_device_id[count++] = palDevice;
+    }
+    if (count == 0) {
+        LOG(ERROR) << __func__ << ": unsupported device " << std::hex << hal_device_id;
+        return -EINVAL;
+    }
+    return static_cast<int>(count);
+}
+} // namespace
+
 void GefExtension::gef_interface_init() {
     if (gef_init) gef_init();
 }
 
 void GefExtension::gef_interface_deinit() {
     if (gef_deinit) gef_deinit();
+    if (gef_legacy_deinit && gef_legacy_ptr) gef_legacy_deinit(gef_legacy_ptr);
+    gef_legacy_ptr = nullptr;
 }
 
 GefExtension::~GefExtension() {
@@ -514,17 +614,27 @@ GefExtension::~GefExtension() {
 GefExtension::GefExtension() : AudioExtensionBase(kGefLibrary, true) {
     LOG(INFO) << __func__ << " Enter";
     if (mHandle != nullptr) {
-        if (!(gef_init = (gef_init_t)dlsym(mHandle, "gef_interface_init")) ||
-            !(gef_deinit = (gef_deinit_t)dlsym(mHandle, "gef_interface_deinit"))) {
-            LOG(ERROR) << __func__ << "dlsym failed";
-            goto feature_disabled;
+        if ((gef_init = (gef_init_t)dlsym(mHandle, "gef_interface_init")) &&
+            (gef_deinit = (gef_deinit_t)dlsym(mHandle, "gef_interface_deinit"))) {
+            LOG(INFO) << __func__ << "----- GEF interface is initialized ----";
+            gef_interface_init();
+            return;
         }
-        LOG(INFO) << __func__ << "----- GEF interface is initialized ----";
-        gef_interface_init();
-        return;
+        gef_init = NULL;
+        gef_deinit = NULL;
+
+        // Older libqtigefar (legacy HAL API): without gef_init() its PAL info callback stays
+        // NULL and effects that drive it, such as the Dolby hardware DAP, crash the HAL
+        auto legacyInit = (gef_legacy_init_t)dlsym(mHandle, "gef_init");
+        gef_legacy_deinit = (gef_legacy_deinit_t)dlsym(mHandle, "gef_deinit");
+        if (legacyInit && gef_legacy_deinit) {
+            gef_legacy_ptr = legacyInit(this, gefLegacyGetPalInfo);
+            LOG(INFO) << __func__ << "----- legacy GEF interface is initialized ----";
+            return;
+        }
+        LOG(ERROR) << __func__ << "dlsym failed";
     }
 
-feature_disabled:
     if (mHandle) {
         dlclose(mHandle);
         mHandle = NULL;
@@ -532,5 +642,6 @@ feature_disabled:
 
     gef_init = NULL;
     gef_deinit = NULL;
+    gef_legacy_deinit = NULL;
 }
 } // namespace qti::audio::core
